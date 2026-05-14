@@ -1,0 +1,16 @@
+{
+  "name": "wa-playwright",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node src/index.js",
+    "build": "echo 'No build step'",
+    "lint": "eslint src",
+    "install:browsers": "playwright install chromium"
+  },
+  "dependencies": {
+    "playwright": "^1.44.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}

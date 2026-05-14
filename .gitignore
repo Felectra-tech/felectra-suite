@@ -1,0 +1,9 @@
+node_modules/
+session/
+messages.json
+.env
+__pycache__/
+*.pyc
+.venv/
+dist/
+.turbo/
