@@ -1,69 +1,73 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import Optional
-import json
+import logging
 import os
+import sys
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
-app = FastAPI(title="WhatsApp Message Reader API", version="0.1.0")
+from src.core.config import settings
+from src.core.database import init_db
+from src.api.routes import auth, messages, groups, stats
 
-MESSAGES_FILE = os.getenv("MESSAGES_FILE", "messages.json")
-
-
-class Message(BaseModel):
-    id: str
-    contact: str
-    text: str
-    timestamp: str
-    direction: str  # "inbound" | "outbound"
-
-
-class SendRequest(BaseModel):
-    contact: str
-    text: str
-
-
-def load_messages() -> list[dict]:
-    if not os.path.exists(MESSAGES_FILE):
-        return []
-    with open(MESSAGES_FILE) as f:
-        return json.load(f)
+# ── Logging ──────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.DEBUG if settings.DEBUG else logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger(__name__)
 
 
-def save_messages(messages: list[dict]) -> None:
-    with open(MESSAGES_FILE, "w") as f:
-        json.dump(messages, f, indent=2)
+# ── Lifespan ─────────────────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Starting %s v%s", settings.APP_NAME, settings.APP_VERSION)
+    init_db()
+    # Ensure all download subfolders exist on startup
+    media_root = os.path.abspath(settings.MEDIA_DIR)
+    for sub in ("images", "audio", "videos", "documents", "stickers", "contacts", "others"):
+        os.makedirs(os.path.join(media_root, sub), exist_ok=True)
+    logger.info("Media directory ready: %s", media_root)
+    yield
+    logger.info("Shutting down.")
 
 
-@app.get("/messages", response_model=list[Message])
-def get_messages(contact: Optional[str] = None, limit: int = 50):
-    messages = load_messages()
-    if contact:
-        messages = [m for m in messages if m.get("contact") == contact]
-    return messages[-limit:]
+# ── App ───────────────────────────────────────────────────────────────────────
+app = FastAPI(
+    title=settings.APP_NAME,
+    version=settings.APP_VERSION,
+    description="Production-ready WhatsApp Automation Platform API",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins_list,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+API_PREFIX = "/api/v1"
+app.include_router(auth.router, prefix=API_PREFIX)
+app.include_router(messages.router, prefix=API_PREFIX)
+app.include_router(groups.router, prefix=API_PREFIX)
+app.include_router(stats.router, prefix=API_PREFIX)
+
+# ── Static media serving ─────────────────────────────────────────────────────
+# Downloaded files accessible at: GET /media/<subfolder>/<filename>
+# Example: http://127.0.0.1:8000/media/images/20260519_Contact_abc12345.jpg
+_media_root = os.path.abspath(settings.MEDIA_DIR)
+os.makedirs(_media_root, exist_ok=True)
+app.mount("/media", StaticFiles(directory=_media_root), name="media")
 
 
-@app.get("/messages/{message_id}", response_model=Message)
-def get_message(message_id: str):
-    messages = load_messages()
-    match = next((m for m in messages if m["id"] == message_id), None)
-    if not match:
-        raise HTTPException(status_code=404, detail="Message not found")
-    return match
+@app.get("/", tags=["Health"])
+def health():
+    return {"status": "ok", "app": settings.APP_NAME, "version": settings.APP_VERSION}
 
 
-@app.post("/messages", response_model=Message, status_code=201)
-def ingest_message(message: Message):
-    """Endpoint for the scraper apps to push messages into."""
-    messages = load_messages()
-    messages.append(message.model_dump())
-    save_messages(messages)
-    return message
-
-
-@app.delete("/messages/{message_id}", status_code=204)
-def delete_message(message_id: str):
-    messages = load_messages()
-    updated = [m for m in messages if m["id"] != message_id]
-    if len(updated) == len(messages):
-        raise HTTPException(status_code=404, detail="Message not found")
-    save_messages(updated)
+@app.get("/health", tags=["Health"])
+def health_check():
+    return {"status": "healthy"}
