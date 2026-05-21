@@ -1,67 +1,135 @@
-import puppeteer from 'puppeteer';
-import qrcode from 'qrcode-terminal';
+// src/index.js — WhatsApp Web Puppeteer Automation — Entry Point
+import 'dotenv/config';
+import { launchBrowser, ensureLoggedIn, waitForReady, sleep } from './auth.js';
+import { listChats, openChatByIndex, extractMessages, getCurrentChatName, scrollConversationToTop } from './scraper.js';
+import { extractGroupMessages, extractGroupInfo, isGroupChat } from './group-scraper.js';
+import { sendAndRecord } from './sender.js';
+import { registerUser, authenticate, pushMessages, pushGroup } from './api-client.js';
+import { logger } from './logger.js';
 
-const WA_WEB_URL = 'https://web.whatsapp.com';
+const CHAT_SCAN_LIMIT = parseInt(process.env.CHAT_SCAN_LIMIT || '20', 10);
+const POLL_INTERVAL   = parseInt(process.env.POLL_INTERVAL   || '5000', 10);
 
-async function launchBrowser() {
-  return puppeteer.launch({
-    headless: false,
-    userDataDir: './session',
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+// Deduplication: track seen messages across polls
+const seenMessages = new Set();
+
+function dedupeMessages(messages) {
+  return messages.filter(m => {
+    const key = `${m.contact}::${m.sender}::${m.text}::${m.timestamp}`;
+    if (seenMessages.has(key)) return false;
+    seenMessages.add(key);
+    return true;
   });
 }
 
-async function waitForQR(page) {
-  console.log('Waiting for QR code...');
-  await page.waitForSelector('canvas[aria-label="Scan this QR code to link a device"]', {
-    timeout: 60_000,
-  });
-  const qrData = await page.evaluate(() => {
-    const canvas = document.querySelector('canvas[aria-label="Scan this QR code to link a device"]');
-    return canvas?.toDataURL();
-  });
-  if (qrData) qrcode.generate(qrData, { small: true });
+async function scanAllChats(page) {
+  logger.info('=== Starting full chat scan ===');
+  const chats = await listChats(page, CHAT_SCAN_LIMIT);
+  logger.info('Found %d chats to scan', chats.length);
+
+  for (let i = 0; i < chats.length; i++) {
+    try {
+      const opened = await openChatByIndex(page, i);
+      if (!opened) continue;
+
+      const name  = await getCurrentChatName(page);
+      const group = await isGroupChat(page);
+
+      await scrollConversationToTop(page, 3);
+
+      let messages;
+      if (group) {
+        logger.info('[%d/%d] Group chat: %s', i + 1, chats.length, name);
+        messages = await extractGroupMessages(page, name, 'puppeteer');
+
+        const groupInfo = await extractGroupInfo(page, name, 'puppeteer');
+        if (groupInfo) {
+          await pushGroup(groupInfo).catch(e => logger.warn('pushGroup: %s', e.message));
+        }
+      } else {
+        logger.info('[%d/%d] Personal chat: %s', i + 1, chats.length, name);
+        messages = await extractMessages(page, name, 'puppeteer');
+      }
+
+      const fresh = dedupeMessages(messages);
+      if (fresh.length > 0) {
+        logger.info('Pushing %d new messages for "%s"', fresh.length, name);
+        await pushMessages(fresh);
+      } else {
+        logger.debug('No new messages for "%s"', name);
+      }
+    } catch (err) {
+      logger.error('Error scanning chat %d: %s', i, err.message);
+    }
+
+    await sleep(500);
+  }
+  logger.info('=== Full chat scan complete ===');
 }
 
-async function waitForLogin(page) {
-  await page.waitForSelector('[data-testid="chat-list"]', { timeout: 120_000 });
-  console.log('Logged in.');
+async function pollForNewMessages(page) {
+  logger.info('Polling for new messages every %dms…', POLL_INTERVAL);
+  while (true) {
+    try {
+      const name  = await getCurrentChatName(page);
+      const group = await isGroupChat(page);
+      const messages = group
+        ? await extractGroupMessages(page, name, 'puppeteer')
+        : await extractMessages(page, name, 'puppeteer');
+
+      const fresh = dedupeMessages(messages);
+      if (fresh.length > 0) {
+        logger.info('Pushing %d new messages (poll)', fresh.length);
+        await pushMessages(fresh);
+      }
+    } catch (err) {
+      logger.warn('Poll error: %s', err.message);
+    }
+    await sleep(POLL_INTERVAL);
+  }
 }
 
-async function readMessages(page) {
-  return page.evaluate(() => {
-    const rows = document.querySelectorAll('[data-testid="msg-container"]');
-    return Array.from(rows).map((el) => ({
-      text: el.querySelector('.copyable-text')?.innerText ?? '',
-      timestamp: el.querySelector('[data-pre-plain-text]')?.getAttribute('data-pre-plain-text') ?? '',
-    }));
-  });
-}
+async function main() {
+  logger.info('WhatsApp Puppeteer Automation starting…');
 
-async function sendMessage(page, contactName, text) {
-  const searchBox = await page.$('[data-testid="chat-list-search"]');
-  await searchBox.click();
-  await searchBox.type(contactName, { delay: 50 });
-  await page.waitForSelector(`[title="${contactName}"]`, { timeout: 10_000 });
-  await page.click(`[title="${contactName}"]`);
+  // 1. Backend auth
+  await registerUser();
+  await authenticate();
 
-  const input = await page.waitForSelector('[data-testid="conversation-compose-box-input"]');
-  await input.type(text, { delay: 30 });
-  await page.keyboard.press('Enter');
-  console.log(`Sent to ${contactName}: ${text}`);
-}
+  // 2. Browser + WhatsApp login
+  const { browser, page } = await launchBrowser();
+  await ensureLoggedIn(page);
+  await waitForReady(page);
 
-(async () => {
-  const browser = await launchBrowser();
-  const page = await browser.newPage();
-  await page.goto(WA_WEB_URL, { waitUntil: 'networkidle2' });
+  // 3. Full initial scan
+  await scanAllChats(page);
 
-  const isLoggedIn = await page.$('[data-testid="chat-list"]').catch(() => null);
-  if (!isLoggedIn) {
-    await waitForQR(page);
-    await waitForLogin(page);
+  // 4. Optional test message
+  const TEST_CONTACT = process.env.TEST_SEND_CONTACT;
+  const TEST_MESSAGE = process.env.TEST_SEND_MESSAGE;
+  if (TEST_CONTACT && TEST_MESSAGE) {
+    logger.info('Sending test message to "%s"', TEST_CONTACT);
+    const record = await sendAndRecord(page, TEST_CONTACT, TEST_MESSAGE, 'puppeteer');
+    if (record._sent) {
+      delete record._sent;
+      await pushMessages([record]);
+    }
   }
 
-  const messages = await readMessages(page);
-  console.log('Recent messages:', messages);
-})();
+  // 5. Graceful shutdown on SIGINT / SIGTERM
+  const shutdown = async (signal) => {
+    logger.info('Received %s — closing browser…', signal);
+    await browser.close();
+    process.exit(0);
+  };
+  process.on('SIGINT',  () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+  // 6. Polling loop
+  await pollForNewMessages(page);
+}
+
+main().catch(err => {
+  logger.error('Fatal error: %s\n%s', err.message, err.stack);
+  process.exit(1);
+});
