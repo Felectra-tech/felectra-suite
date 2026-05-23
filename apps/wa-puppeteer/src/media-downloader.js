@@ -4,11 +4,9 @@ import path from 'path';
 import crypto from 'crypto';
 import { logger } from './logger.js';
 
-// ── Config ────────────────────────────────────────────────────────────────────
-const DOWNLOAD_MEDIA = process.env.DOWNLOAD_MEDIA !== 'false'; // default true
+const DOWNLOAD_MEDIA = process.env.DOWNLOAD_MEDIA !== 'false';
 const DOWNLOAD_DIR   = path.resolve(process.env.DOWNLOAD_DIR || '../downloads');
 
-// ── MIME → folder + extension map ────────────────────────────────────────────
 const MIME_MAP = {
   'image/jpeg':    { folder: 'images',    ext: 'jpg'  },
   'image/jpg':     { folder: 'images',    ext: 'jpg'  },
@@ -92,15 +90,78 @@ function buildMeta(descriptor, filename, relPath, byteSize = 0) {
 }
 
 /**
- * Extract raw media descriptors from the currently open conversation (Puppeteer).
- * Puppeteer uses page.evaluate() — same DOM extraction logic as Playwright.
+ * Click each media thumbnail to trigger blob URL generation,
+ * then close the viewer. This forces WhatsApp to load the actual media.
  */
+async function triggerMediaLoad(page) {
+  try {
+    // Get all media containers that have unloaded thumbnails
+    const mediaCount = await page.evaluate(() => {
+      const containers = document.querySelectorAll('[data-testid="msg-container"]');
+      let count = 0;
+      containers.forEach(el => {
+        const img = el.querySelector('img');
+        if (img && (!img.src || img.src === '' || img.src.startsWith('data:image/gif'))) count++;
+        const audio = el.querySelector('audio');
+        if (audio && (!audio.src || audio.src === '')) count++;
+        const video = el.querySelector('video');
+        if (video && (!video.src || video.src === '')) count++;
+      });
+      return count;
+    });
+
+    if (mediaCount === 0) return;
+    logger.debug('Triggering load for %d unloaded media items', mediaCount);
+
+    // Click each download button if visible (for undownloaded media)
+    const downloadBtns = await page.$$('[data-testid="msg-container"] [data-testid="media-download-btn"]');
+    for (const btn of downloadBtns) {
+      try {
+        await btn.click();
+        await page.waitForTimeout(800);
+      } catch { /* ignore */ }
+    }
+
+    // Click image thumbnails to open viewer and load blob
+    const imgContainers = await page.$$('[data-testid="msg-container"] [data-testid="image-thumb"], [data-testid="msg-container"] [data-testid="media-url-img"]');
+    for (const container of imgContainers) {
+      try {
+        await container.click();
+        // Wait for blob to be set in the opened viewer
+        await page.waitForSelector('img[src^="blob:"]', { timeout: 3000 }).catch(() => {});
+        // Close the viewer with Escape
+        await page.keyboard.press('Escape');
+        await new Promise(r => setTimeout(r, 500));
+      } catch { /* ignore */ }
+    }
+
+    // Small wait for all blobs to settle
+    await new Promise(r => setTimeout(r, 1000));
+
+  } catch (err) {
+    logger.debug('triggerMediaLoad error: %s', err.message);
+  }
+}
+
 export async function extractMediaDescriptors(page) {
-  return await page.evaluate(() => {
+  return await page.evaluate(async () => {
     const containers = document.querySelectorAll('[data-testid="msg-container"]');
     const results    = [];
 
-    containers.forEach((el) => {
+    async function blobToBase64(blobUrl) {
+      try {
+        const res = await fetch(blobUrl);
+        const ab  = await res.arrayBuffer();
+        const bytes = new Uint8Array(ab);
+        let binary = '';
+        for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+        return btoa(binary);
+      } catch {
+        return null;
+      }
+    }
+
+    for (const el of containers) {
       const prePlain = el.querySelector('[data-pre-plain-text]')
         ?.getAttribute('data-pre-plain-text') || '';
       const isOut    = el.closest('[class*="message-out"]') !== null;
@@ -118,17 +179,16 @@ export async function extractMediaDescriptors(page) {
       if (imgEl) {
         const isSticker = !!el.querySelector('[data-testid="sticker-container"], [data-testid="sticker"]');
         const captionEl = el.querySelector('[data-testid="msg-txt"] span, .copyable-text span');
+        const src = imgEl.src || imgEl.getAttribute('src') || '';
+        const base64 = src.startsWith('blob:') ? await blobToBase64(src) : null;
         results.push({
           mediaType: isSticker ? 'sticker' : 'image',
           mimeType:  isSticker ? 'image/webp' : 'image/jpeg',
-          src:       imgEl.src || imgEl.getAttribute('src') || '',
+          src, base64,
           caption:   captionEl?.innerText?.trim() || '',
-          isSticker,
-          isOutgoing: isOut,
-          timestamp:  parsedTime,
-          sender:     parsedSender,
+          isSticker, isOutgoing: isOut, timestamp: parsedTime, sender: parsedSender,
         });
-        return;
+        continue;
       }
 
       // Audio
@@ -137,32 +197,30 @@ export async function extractMediaDescriptors(page) {
       );
       if (audioEl) {
         const durEl = el.querySelector('[data-testid="audio-duration"]');
+        const src = audioEl.src || '';
+        const base64 = src.startsWith('blob:') ? await blobToBase64(src) : null;
         results.push({
-          mediaType:  'audio',
-          mimeType:   'audio/ogg',
-          src:        audioEl.src || '',
-          duration:   durEl?.innerText?.trim() || '',
-          isOutgoing: isOut,
-          timestamp:  parsedTime,
-          sender:     parsedSender,
+          mediaType: 'audio', mimeType: 'audio/ogg',
+          src, base64,
+          duration: durEl?.innerText?.trim() || '',
+          isOutgoing: isOut, timestamp: parsedTime, sender: parsedSender,
         });
-        return;
+        continue;
       }
 
       // Video
       const videoEl = el.querySelector('video[src^="blob:"], [data-testid="video-player"] video');
       if (videoEl) {
         const captionEl = el.querySelector('[data-testid="msg-txt"] span, .copyable-text span');
+        const src = videoEl.src || '';
+        const base64 = src.startsWith('blob:') ? await blobToBase64(src) : null;
         results.push({
-          mediaType:  'video',
-          mimeType:   'video/mp4',
-          src:        videoEl.src || '',
-          caption:    captionEl?.innerText?.trim() || '',
-          isOutgoing: isOut,
-          timestamp:  parsedTime,
-          sender:     parsedSender,
+          mediaType: 'video', mimeType: 'video/mp4',
+          src, base64,
+          caption: captionEl?.innerText?.trim() || '',
+          isOutgoing: isOut, timestamp: parsedTime, sender: parsedSender,
         });
-        return;
+        continue;
       }
 
       // Document
@@ -170,21 +228,21 @@ export async function extractMediaDescriptors(page) {
         '[data-testid="document-container"], [data-testid="media-document"]'
       );
       if (docEl) {
-        const nameEl  = docEl.querySelector('[data-testid="doc-title"], ._ao3e, span[title]');
-        const mimeEl  = docEl.querySelector('[data-testid="doc-mime-type"]');
-        const sizeEl  = docEl.querySelector('[data-testid="doc-size"]');
-        const dlLink  = docEl.querySelector('a[href^="blob:"], a[download]');
+        const nameEl = docEl.querySelector('[data-testid="doc-title"], ._ao3e, span[title]');
+        const mimeEl = docEl.querySelector('[data-testid="doc-mime-type"]');
+        const sizeEl = docEl.querySelector('[data-testid="doc-size"]');
+        const dlLink = docEl.querySelector('a[href^="blob:"], a[download]');
+        const src = dlLink?.href || '';
+        const base64 = src.startsWith('blob:') ? await blobToBase64(src) : null;
         results.push({
-          mediaType:  'document',
-          mimeType:   mimeEl?.innerText?.trim() || 'application/octet-stream',
-          src:        dlLink?.href || '',
-          filename:   nameEl?.getAttribute('title') || nameEl?.innerText?.trim() || 'document',
-          size:       sizeEl?.innerText?.trim() || '',
-          isOutgoing: isOut,
-          timestamp:  parsedTime,
-          sender:     parsedSender,
+          mediaType: 'document',
+          mimeType:  mimeEl?.innerText?.trim() || 'application/octet-stream',
+          src, base64,
+          filename: nameEl?.getAttribute('title') || nameEl?.innerText?.trim() || 'document',
+          size:     sizeEl?.innerText?.trim() || '',
+          isOutgoing: isOut, timestamp: parsedTime, sender: parsedSender,
         });
-        return;
+        continue;
       }
 
       // Contact card
@@ -192,35 +250,20 @@ export async function extractMediaDescriptors(page) {
       if (vcardEl) {
         const nameEl = vcardEl.querySelector('[data-testid="vcard-name"], span[title]');
         results.push({
-          mediaType:  'contact',
-          mimeType:   'text/vcard',
-          src:        '',
-          filename:   (nameEl?.innerText?.trim() || 'contact') + '.vcf',
-          isOutgoing: isOut,
-          timestamp:  parsedTime,
-          sender:     parsedSender,
+          mediaType: 'contact', mimeType: 'text/vcard',
+          src: '', base64: null,
+          filename: (nameEl?.innerText?.trim() || 'contact') + '.vcf',
+          isOutgoing: isOut, timestamp: parsedTime, sender: parsedSender,
         });
       }
-    });
+    }
 
     return results;
   });
 }
 
-/**
- * Download a single media item using native fetch (works inside Node.js for http URLs)
- * and page.evaluate fetch for blob: URLs.
- *
- * @param {import('puppeteer').Page} page
- * @param {object} descriptor
- * @param {string} contactName
- */
 export async function downloadMediaItem(page, descriptor, contactName) {
   if (!DOWNLOAD_MEDIA) return null;
-  if (!descriptor.src) {
-    logger.debug('No src for %s', descriptor.mediaType);
-    return null;
-  }
 
   const isSticker       = descriptor.isSticker || descriptor.mediaType === 'sticker';
   const { folder, ext } = resolveFolderAndExt(descriptor.mimeType, isSticker);
@@ -241,28 +284,11 @@ export async function downloadMediaItem(page, descriptor, contactName) {
   try {
     let buffer;
 
-    if (descriptor.src.startsWith('blob:')) {
-      // Puppeteer: read blob from within the page using fetch + ArrayBuffer
-      const bytes = await page.evaluate(async (blobUrl) => {
-        try {
-          const res = await fetch(blobUrl);
-          const ab  = await res.arrayBuffer();
-          return Array.from(new Uint8Array(ab));
-        } catch { return null; }
-      }, descriptor.src);
-
-      if (!bytes) {
-        logger.warn('Failed to read blob for %s', descriptor.mediaType);
-        return null;
-      }
-      buffer = Buffer.from(bytes);
-
-    } else if (descriptor.src.startsWith('http')) {
-      // For CDN URLs: use node-fetch (available as global fetch in Node 18+)
-      // Puppeteer shares cookies via CDP — we pass cookies manually
+    if (descriptor.base64) {
+      buffer = Buffer.from(descriptor.base64, 'base64');
+    } else if (descriptor.src?.startsWith('http')) {
       const cookies = await page.cookies();
       const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
-
       const res = await fetch(descriptor.src, {
         headers: {
           Cookie: cookieHeader,
@@ -270,21 +296,18 @@ export async function downloadMediaItem(page, descriptor, contactName) {
         },
         signal: AbortSignal.timeout(30_000),
       });
-
       if (!res.ok) {
         logger.warn('HTTP %d fetching %s', res.status, descriptor.src);
         return null;
       }
-
-      const ab = await res.arrayBuffer();
-      buffer   = Buffer.from(ab);
+      buffer = Buffer.from(await res.arrayBuffer());
     } else {
-      logger.debug('Unsupported src scheme for %s', descriptor.mediaType);
+      logger.debug('No src or base64 for %s — skipping', descriptor.mediaType);
       return null;
     }
 
     fs.writeFileSync(localPath, buffer);
-    logger.info('Downloaded %s → %s (%d bytes)', descriptor.mediaType, filename, buffer.length);
+    logger.info('Downloaded %s -> %s (%d bytes)', descriptor.mediaType, filename, buffer.length);
     return buildMeta(descriptor, filename, relPath, buffer.length);
 
   } catch (err) {
@@ -293,15 +316,11 @@ export async function downloadMediaItem(page, descriptor, contactName) {
   }
 }
 
-/**
- * Process all media in the currently open conversation.
- * Returns array of attachment metadata objects.
- *
- * @param {import('puppeteer').Page} page
- * @param {string} contactName
- */
 export async function downloadAllMedia(page, contactName) {
   if (!DOWNLOAD_MEDIA) return [];
+
+  // Trigger media load by clicking thumbnails/download buttons
+  await triggerMediaLoad(page);
 
   let descriptors = [];
   try {

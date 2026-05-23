@@ -2,7 +2,7 @@
 import { logger } from './logger.js';
 import { sleep } from './auth.js';
 import { downloadAllMedia } from './media-downloader.js';
-
+ 
 export async function listChats(page, limit = 20) {
   logger.info('Listing chats (limit=%d)…', limit);
   try {
@@ -27,17 +27,36 @@ export async function listChats(page, limit = 20) {
     return [];
   }
 }
-
+ 
+/**
+ * Click a chat using real mouse coordinates to avoid:
+ *  - stale element handles (old approach: page.$$ then handle.click())
+ *  - bot detection (synthetic JS click via evaluate)
+ * We get the bounding box inside evaluate (no handle crosses frame boundary)
+ * then fire a real mouse event via page.mouse.click().
+ */
 export async function openChatByIndex(page, index) {
   await page.waitForSelector('[data-testid="cell-frame-container"]', { timeout: 15_000 });
-  const rows = await page.$$('[data-testid="cell-frame-container"]');
-  if (!rows[index]) return false;
-  await rows[index].click();
+ 
+  const box = await page.evaluate((idx) => {
+    const rows = document.querySelectorAll('[data-testid="cell-frame-container"]');
+    if (!rows[idx]) return null;
+    rows[idx].scrollIntoView({ block: 'center', behavior: 'instant' });
+    const rect = rows[idx].getBoundingClientRect();
+    return {
+      x: Math.round(rect.left + rect.width  / 2),
+      y: Math.round(rect.top  + rect.height / 2),
+    };
+  }, index);
+ 
+  if (!box) { logger.warn('openChatByIndex: no row at index %d', index); return false; }
+ 
+  await page.mouse.click(box.x, box.y);
   await page.waitForSelector('[data-testid="conversation-panel-messages"]', { timeout: 15_000 });
   await sleep(800);
   return true;
 }
-
+ 
 export async function openChatByName(page, name) {
   logger.debug('Opening chat: %s', name);
   try {
@@ -56,15 +75,15 @@ export async function openChatByName(page, name) {
     return false;
   }
 }
-
+ 
 export async function extractMessages(page, contactName, source = 'puppeteer') {
   logger.debug('Extracting messages: %s', contactName);
-
+ 
   const attachmentsPromise = downloadAllMedia(page, contactName).catch(e => {
     logger.warn('Media download error: %s', e.message);
     return [];
   });
-
+ 
   let textMessages = [];
   try {
     textMessages = await page.evaluate(
@@ -76,7 +95,7 @@ export async function extractMessages(page, contactName, source = 'puppeteer') {
           const textEl   = el.querySelector('[data-testid="msg-txt"] span, .copyable-text span');
           const timeEl   = el.querySelector('._ao3e');
           const isOut    = el.closest('[class*="message-out"]') !== null;
-
+ 
           let parsedSender = '', parsedTime = '';
           if (prePlain) {
             const m = prePlain.match(/\[(.+?)\]\s*(.*?):/);
@@ -104,7 +123,7 @@ export async function extractMessages(page, contactName, source = 'puppeteer') {
   } catch (err) {
     logger.error('extractMessages error: %s', err.message);
   }
-
+ 
   const attachments = await attachmentsPromise;
   if (attachments.length > 0) {
     if (textMessages.length > 0) {
@@ -125,22 +144,25 @@ export async function extractMessages(page, contactName, source = 'puppeteer') {
       });
     }
   }
-
   return textMessages;
 }
-
+ 
+// Evaluate-only — no element handles cross the frame boundary
 export async function getCurrentChatName(page) {
   try {
-    const el = await page.$('[data-testid="conversation-header"] span[title]');
-    return await page.evaluate(e => e?.getAttribute('title') || 'Unknown', el);
+    return await page.evaluate(() => {
+      const el = document.querySelector('[data-testid="conversation-header"] span[title]');
+      return el?.getAttribute('title') || 'Unknown';
+    });
   } catch { return 'Unknown'; }
 }
-
+ 
 export async function scrollConversationToTop(page, times = 5) {
-  const panel = await page.$('[data-testid="conversation-panel-messages"]');
-  if (!panel) return;
   for (let i = 0; i < times; i++) {
-    await page.evaluate(el => { el.scrollTop = 0; }, panel);
+    await page.evaluate(() => {
+      const panel = document.querySelector('[data-testid="conversation-panel-messages"]');
+      if (panel) panel.scrollTop = 0;
+    }).catch(() => {});
     await sleep(600);
   }
 }
